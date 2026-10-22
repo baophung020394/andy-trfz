@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: cedar-kb-nightly
+    runtime: docker
+    plan: free
+    healthCheckPath: /health
+    dockerfilePath: ./Dockerfile
+    dockerCommand: uvicorn src.server:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: FILE_SEARCH_STORE_NAME
+        sync: false
+      - key: CRON_SECRET
+        generateValue: true
+      - key: ARTICLES_DIR
+        value: /tmp/articles
+      - key: LAST_RUN_PATH
+        value: /tmp/last_run.json
