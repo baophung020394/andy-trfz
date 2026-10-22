@@ -27,11 +27,13 @@ Option B — manual:
 1. **New** → **Web Service** → this repo.
 2. Runtime: **Docker**.
 3. Instance: **Free**.
-4. Docker command (override the one-shot CMD):
+4. **Docker / Start Command** (bắt buộc — override CMD `python main.py` trong Dockerfile):
 
 ```text
 uvicorn src.server:app --host 0.0.0.0 --port $PORT
 ```
+
+Nếu để mặc định `python main.py`, Render sẽ **ingest ngay lúc deploy** và crash khi Gemini lỗi 1 file → service không lên. Đề bài: service chỉ listen HTTP; ingest chạy khi cron gọi **`GET /run`** (không dùng `/execute`).
 
 5. Health check path: `/health`.
 

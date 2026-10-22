@@ -17,3 +17,5 @@ services:
         value: /tmp/articles
       - key: LAST_RUN_PATH
         value: /tmp/last_run.json
+      - key: DELETE_STALE_REMOTE
+        value: "false"

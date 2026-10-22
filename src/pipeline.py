@@ -29,13 +29,17 @@ class RunResult:
     store_name: str = ""
     finished_at: str = ""
     error: str | None = None
+    failed_uploads: list[str] | None = None
 
     def log_line(self) -> str:
-        return (
+        line = (
             f"added={self.added} updated={self.updated} skipped={self.skipped} "
             f"deleted={self.deleted} files_uploaded={self.files_uploaded} "
             f"chunks_embedded={self.chunks_embedded}"
         )
+        if self.failed_uploads:
+            line += f" failed_uploads={len(self.failed_uploads)}"
+        return line
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -124,7 +128,7 @@ def run_pipeline(settings: Settings | None = None, upload: bool = True) -> RunRe
         )
         for article_id in diff.upload_ids
     )
-    files_uploaded = apply_diff(
+    files_uploaded, failed_uploads = apply_diff(
         client,
         store_name,
         diff,
@@ -133,8 +137,23 @@ def run_pipeline(settings: Settings | None = None, upload: bool = True) -> RunRe
         remote_docs,
         settings,
     )
+    if failed_uploads and files_uploaded == 0 and diff.upload_ids:
+        status = "error"
+        error = (
+            f"Failed to upload all {len(failed_uploads)} article(s): "
+            + ", ".join(failed_uploads[:20])
+        )
+    elif failed_uploads:
+        status = "partial"
+        error = (
+            f"Failed to upload {len(failed_uploads)} article(s): "
+            + ", ".join(failed_uploads[:20])
+        )
+    else:
+        status = "ok"
+        error = None
     result = RunResult(
-        status="ok",
+        status=status,
         added=len(diff.added),
         updated=len(diff.updated),
         skipped=len(diff.skipped),
@@ -144,7 +163,11 @@ def run_pipeline(settings: Settings | None = None, upload: bool = True) -> RunRe
         article_count=len(local),
         store_name=store_name,
         finished_at=datetime.now(timezone.utc).isoformat(),
+        error=error,
+        failed_uploads=failed_uploads or None,
     )
     logger.info(result.log_line())
     save_last_run(settings.last_run_path, result)
+    if status == "error":
+        raise RuntimeError(error)
     return result

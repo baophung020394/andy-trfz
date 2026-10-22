@@ -285,7 +285,12 @@ def apply_diff(
     local_hashes: dict[str, str],
     remote_docs: dict[str, dict[str, str]],
     settings: Settings,
-) -> int:
+) -> tuple[int, list[str]]:
+    """Upload added/updated docs. Returns (uploaded_count, failed_article_ids).
+
+    Does not raise on partial failure so a single flaky Gemini file (e.g. token
+    count 503) cannot take down Docker one-shot or Render ``/run``.
+    """
     uploaded = 0
     failures: list[tuple[str, Exception]] = []
     for article_id in diff.updated:
@@ -316,11 +321,16 @@ def apply_diff(
             failures.append((article_id, exc))
         if index < total and UPLOAD_GAP_SEC > 0:
             time.sleep(UPLOAD_GAP_SEC)
+    failed_ids = [article_id for article_id, _ in failures]
     if failures:
-        ids = ", ".join(article_id for article_id, _ in failures[:20])
+        ids = ", ".join(failed_ids[:20])
         more = "" if len(failures) <= 20 else f" (+{len(failures) - 20} more)"
-        raise RuntimeError(
-            f"Failed to upload {len(failures)}/{total} article(s): {ids}{more}. "
-            "Re-run python main.py to retry remaining files."
+        logger.error(
+            "Failed to upload %s/%s article(s): %s%s. "
+            "Re-run python main.py (or GET /run) to retry remaining files.",
+            len(failures),
+            total,
+            ids,
+            more,
         )
-    return uploaded
+    return uploaded, failed_ids
