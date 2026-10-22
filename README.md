@@ -1,43 +1,29 @@
 # cedar-kb-nightly
 
-Daily Zendesk → Markdown → [Gemini File Search](https://ai.google.dev/gemini-api/docs/file-search) ingest. No chat UI; test in [AI Studio](https://aistudio.google.com/).
+Daily Zendesk Help Center → clean Markdown → [Gemini File Search](https://ai.google.dev/gemini-api/docs/file-search) (API only). No custom chat UI — verify in [AI Studio](https://aistudio.google.com/). Full walkthrough: [docs/README.md](docs/README.md).
 
-Step-by-step: [docs/README.md](docs/README.md).
-
-## Setup
+## Setup & run
 
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-cp .env.sample .env   # set GEMINI_API_KEY
+cp .env.sample .env   # GEMINI_API_KEY (+ FILE_SEARCH_STORE_NAME after first upload)
+python main.py --fetch-only   # articles/*.md only
+python main.py                # fetch + incremental upload to File Search
 ```
 
-Fetch and write Markdown only:
-
-```bash
-python main.py --fetch-only
-```
-
-Upload (creates a File Search store if `FILE_SEARCH_STORE_NAME` is empty; copy the printed name into `.env`):
-
-```bash
-python main.py
-```
-
-Docker one-shot (exits `0` on success; keys via env, never baked in):
+Docker one-shot (exits `0`; secrets via env, never baked into the image):
 
 ```bash
 docker build -t cedar-kb-nightly .
 docker run --rm --env-file .env cedar-kb-nightly
 ```
 
-## Chunking
-
-One Markdown file per article. Gemini indexes with **800-token chunks, 400-token overlap** (`white_space_config`). Local logs estimate the same window (`chars/4`). Incremental compare is SHA-256 of the Markdown plus `article_id`/`content_hash` metadata — unchanged files are `skipped`.
+Incremental sync: SHA-256 of each Markdown + `article_id` / `content_hash` metadata → log `added` / `updated` / `skipped`. Gemini chunking: `MAX_CHUNK_TOKENS=200`, `CHUNK_OVERLAP_TOKENS=20` (`white_space_config`).
 
 ## AI Studio
 
-Create a prompt, paste this **verbatim**, attach the File Search store (do not drag-and-drop files):
+Paste system prompt **verbatim**, attach the File Search store (no drag-and-drop). Ask: `How do I add a YouTube video?` and `Làm thế nào để thêm một video YouTube?`
 
 ```text
 You are OptiBot, the customer-support bot for OptiSigns.com.
@@ -48,19 +34,25 @@ You are OptiBot, the customer-support bot for OptiSigns.com.
 • Cite up to 3 "Article URL:" lines per reply.
 ```
 
-Ask: `How do I add a YouTube video?` and `Làm thế nào để thêm một video YouTube?`
+![English](screenshots/youtube-en.png)
+![Vietnamese](screenshots/youtube-vi.png)
 
-![English answer](screenshots/youtube-en.png)
-![Vietnamese answer](screenshots/youtube-vi.png)
+## Daily job (Render free + cron-job.org)
 
-## Daily job (free)
+Web Service start command (override Dockerfile `CMD`):
 
-Render **Web Service** (free) + [cron-job.org](https://cron-job.org/en/):
+`uvicorn src.server:app --host 0.0.0.0 --port $PORT`
 
-1. Deploy with `render.yaml`. Override start: `uvicorn src.server:app --host 0.0.0.0 --port $PORT`.
-2. Wake: `GET https://<app>.onrender.com/health` every 10–14 minutes.
-3. Ingest: `GET https://<app>.onrender.com/run` daily `03:00 UTC`, header `Authorization: Bearer $CRON_SECRET`, save responses.
+| Job | URL | Schedule |
+|-----|-----|----------|
+| Wake | [GET /health](https://andy-trfz.onrender.com/health) | every 10–14 min |
+| Ingest | [GET /run](https://andy-trfz.onrender.com/run) + `Authorization: Bearer $CRON_SECRET` | daily |
 
-Logs: `/last-run` and cron-job.org history. Example: `added=3 updated=1 skipped=411 files_uploaded=4 chunks_embedded=18`.
+**Job logs (submission):**
+
+- Last run JSON: https://andy-trfz.onrender.com/last-run
+- cron-job.org history (ingest, Save responses): _paste console history URL here_
+
+Example log line: `added=3 updated=1 skipped=411 deleted=0 files_uploaded=4 chunks_embedded=18`.
 
 Tests: `pytest`.

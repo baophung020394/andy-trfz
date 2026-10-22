@@ -108,6 +108,9 @@ def run_pipeline(settings: Settings | None = None, upload: bool = True) -> RunRe
 
     client = make_client(settings.gemini_api_key)
     store_name = ensure_store(client, settings.file_search_store_name)
+    # Print early so a long upload / Ctrl+C still leaves a copyable store name.
+    print(f"store_name={store_name}", flush=True)
+    logger.info("Using File Search store %s", store_name)
     deleted = 0
     if settings.delete_stale_remote:
         logger.info("DELETE_STALE_REMOTE=true — removing remote docs not in local set")
