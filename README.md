@@ -34,8 +34,6 @@ You are OptiBot, the customer-support bot for OptiSigns.com.
 • Cite up to 3 "Article URL:" lines per reply.
 ```
 
-![English](screenshots/result.png)
-
 ## Daily job (Render free + cron-job.org)
 
 Web Service start command (override Dockerfile `CMD`):
@@ -56,3 +54,6 @@ Web Service start command (override Dockerfile `CMD`):
 Example log line: `added=3 updated=1 skipped=411 deleted=0 files_uploaded=4 chunks_embedded=18`.
 
 Tests: `pytest`.
+
+# Result from playground Gemini
+![English](screenshots/result.png)
