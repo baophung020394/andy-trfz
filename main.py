@@ -49,7 +49,7 @@ def main() -> int:
     if result.error:
         print(f"error={result.error}", file=sys.stderr)
     # partial = some uploads ok (e.g. one flaky Gemini file); still exit 0 for Docker.
-    if result.status == "error":
+    if result.status in {"error", "aborted"}:
         return 1
     return 0
 

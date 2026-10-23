@@ -8,8 +8,8 @@ from typing import Any
 from fastapi import FastAPI, Header, HTTPException
 
 from src.config import get_settings
-from src.pipeline import load_last_run, run_pipeline, save_last_run
-from src.pipeline import RunResult
+from src.pipeline import run_pipeline
+from src.progress import AbortRequested, ProgressLogHandler, RunController, get_controller
 
 logging.basicConfig(
     level=logging.INFO,
@@ -18,16 +18,29 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="kb-ingest")
-_lock = threading.Lock()
-_running = False
-_last_run: dict[str, Any] | None = None
+_handler_lock = threading.Lock()
+_log_handler: ProgressLogHandler | None = None
 
 
-def _load_cached_last_run() -> dict[str, Any] | None:
-    global _last_run
-    if _last_run is None:
-        _last_run = load_last_run(get_settings().last_run_path)
-    return _last_run
+def _controller() -> RunController:
+    controller = get_controller()
+    controller.ensure_persist_path(get_settings().last_run_path)
+    return controller
+
+
+def _attach_log_handler() -> None:
+    global _log_handler
+    with _handler_lock:
+        if _log_handler is not None:
+            return
+        handler = ProgressLogHandler()
+        handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+        handler.setLevel(logging.INFO)
+        src_logger = logging.getLogger("src")
+        # Own level so INFO still reaches /last-run when root is WARNING (pytest).
+        src_logger.setLevel(logging.INFO)
+        src_logger.addHandler(handler)
+        _log_handler = handler
 
 
 def _check_secret(authorization: str | None) -> None:
@@ -40,21 +53,23 @@ def _check_secret(authorization: str | None) -> None:
 
 
 def _run_ingest() -> None:
-    global _running, _last_run
+    controller = _controller()
     try:
         result = run_pipeline(upload=True)
-        _last_run = result.to_dict()
+        if controller.running:
+            controller.complete(**result.to_dict(), phase="done")
+    except AbortRequested:
+        logger.info("Ingest aborted")
+        if controller.running:
+            controller.complete(
+                status="aborted",
+                error="Aborted by operator",
+                phase="done",
+            )
     except Exception as exc:  # noqa: BLE001
         logger.exception("Ingest failed")
-        result = RunResult(
-            status="error",
-            error=str(exc),
-        )
-        _last_run = result.to_dict()
-        save_last_run(get_settings().last_run_path, result)
-    finally:
-        with _lock:
-            _running = False
+        if controller.running:
+            controller.complete(status="error", error=str(exc), phase="done")
 
 
 @app.get("/health")
@@ -65,22 +80,29 @@ def health() -> dict[str, bool]:
 @app.get("/run")
 def run(authorization: str | None = Header(default=None)) -> dict[str, Any]:
     _check_secret(authorization)
-    global _running
-    with _lock:
-        if _running:
-            return {"status": "already_running", "last_run": _load_cached_last_run()}
-        _running = True
-        thread = threading.Thread(target=_run_ingest, daemon=True)
-        thread.start()
+    controller = _controller()
+    _attach_log_handler()
+    started = controller.try_begin()
+    if started is None:
+        return {"status": "already_running", "last_run": controller.snapshot()}
+    logger.info("Ingest started")
+    thread = threading.Thread(target=_run_ingest, daemon=True)
+    thread.start()
     return {"status": "started"}
+
+
+@app.get("/abort")
+def abort(authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    _check_secret(authorization)
+    controller = _controller()
+    if controller.request_abort():
+        return {"status": "aborting", "last_run": controller.snapshot()}
+    return {"status": "not_running", "last_run": controller.snapshot()}
 
 
 @app.get("/last-run")
 def last_run() -> dict[str, Any]:
-    payload = _load_cached_last_run()
-    if not payload:
-        return {"status": "none"}
-    return payload
+    return _controller().snapshot()
 
 
 if __name__ == "__main__":

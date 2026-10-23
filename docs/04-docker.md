@@ -47,8 +47,16 @@ curl -H "Authorization: Bearer $CRON_SECRET" http://localhost:8000/run
 # {"status":"started"}
 ```
 
-`/run` responds immediately (202/200). Ingest runs in the background because cron-job.org times out after 30 seconds. Wait, then check:
+`/run` responds immediately (`{"status":"started"}`). Ingest runs in the background because cron-job.org times out after 30 seconds. Poll live logs right away:
 
 ```bash
 curl http://localhost:8000/last-run
+# status=running, logs[], added/updated/skipped as soon as the diff is known
+```
+
+Stop further File Search uploads (current file may finish first):
+
+```bash
+curl -H "Authorization: Bearer $CRON_SECRET" http://localhost:8000/abort
+# {"status":"aborting", ...}
 ```

@@ -76,13 +76,13 @@ This job keeps the instance warm and fits within ~750 free hours/month — enoug
 
 Expected response: `{"status":"started"}` or `{"status":"already_running",...}`. Do not wait for ingest to finish within 30 seconds.
 
-After a few minutes:
+Poll immediately (do not wait for ingest to finish):
 
 ```text
 https://<app>.onrender.com/last-run
 ```
 
-JSON includes `added`, `updated`, `skipped`, `files_uploaded`, `chunks_embedded`, `finished_at`.
+While running: `status=running`, `phase`, `logs`, and counts as soon as the diff is known (`added` / `updated` / `skipped`). After finish: `files_uploaded`, `chunks_embedded`, `finished_at`. Stop leftover uploads with `GET /abort` + the same Bearer token.
 
 ## 5.5. Logs for submission
 

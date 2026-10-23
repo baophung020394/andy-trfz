@@ -47,8 +47,9 @@ Web Service start command (override Dockerfile `CMD`):
 |-----|-----|----------|
 | Wake | [GET /health](https://andy-trfz.onrender.com/health) | every 10–14 min |
 | Ingest | [GET /run](https://andy-trfz.onrender.com/run) + `Authorization: Bearer $CRON_SECRET` | daily |
+| Abort | [GET /abort](https://andy-trfz.onrender.com/abort) + Bearer | stop further uploads |
 
-**Job logs (submission):**
+**Job logs (submission):** `/last-run` is live while ingest runs (`status=running`, `logs`, `added`/`updated`/`skipped`).
 
 - Last run JSON: https://andy-trfz.onrender.com/last-run
 - cron-job.org history (ingest, Save responses): _paste console history URL here_

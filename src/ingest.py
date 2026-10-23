@@ -10,6 +10,7 @@ from google.genai import types
 
 from src.config import Settings
 from src.diff import DiffResult, classify_changes
+from src.progress import AbortRequested, get_controller
 
 logger = logging.getLogger(__name__)
 
@@ -78,6 +79,11 @@ def _metadata_map(doc: Any) -> dict[str, str]:
     return result
 
 
+def _sleep(seconds: float) -> None:
+    """Sleep that /abort can interrupt."""
+    get_controller().sleep(seconds)
+
+
 def _is_retryable(exc: Exception) -> bool:
     """Return True when a fresh retry (new upload session) may succeed.
 
@@ -85,6 +91,8 @@ def _is_retryable(exc: Exception) -> bool:
     gets 400 \"Upload has already been terminated.\" That must start a *new*
     upload, not reuse the dead session.
     """
+    if isinstance(exc, AbortRequested):
+        return False
     code = getattr(exc, "code", None)
     if isinstance(code, int) and code in RETRYABLE_HTTP_CODES:
         return True
@@ -101,6 +109,8 @@ def _with_retry(fn, attempts: int = 6):
     for attempt in range(attempts):
         try:
             return fn()
+        except AbortRequested:
+            raise
         except Exception as exc:  # noqa: BLE001 - SDK raises mixed types
             last_error = exc
             if not _is_retryable(exc):
@@ -113,7 +123,7 @@ def _with_retry(fn, attempts: int = 6):
                 exc,
                 sleep_for,
             )
-            time.sleep(sleep_for)
+            _sleep(sleep_for)
     raise RuntimeError(f"Gemini request failed after retries: {last_error}")
 
 
@@ -149,9 +159,10 @@ def wait_for_operation(
     started = time.time()
     current = operation
     while not getattr(current, "done", False):
+        get_controller().check_abort()
         if time.time() - started > timeout:
             raise TimeoutError("Timed out waiting for File Search upload")
-        time.sleep(2)
+        _sleep(2)
         current = client.operations.get(operation=current)
     error = getattr(current, "error", None)
     if error:
@@ -166,6 +177,7 @@ def list_remote_documents(client: genai.Client, store_name: str) -> dict[str, di
         config={"page_size": 20},
     )
     for doc in pager:
+        get_controller().check_abort()
         meta = _metadata_map(doc)
         article_id = meta.get("article_id")
         if not article_id:
@@ -201,6 +213,7 @@ def delete_stale_remote_documents(
         config={"page_size": 20},
     )
     for doc in pager:
+        get_controller().check_abort()
         name = getattr(doc, "name", "") or ""
         if not name:
             continue
@@ -255,9 +268,10 @@ def upload_markdown(
             current = uploaded
             deadline = time.time() + 120
             while str(getattr(current, "state", "") or "").endswith("PROCESSING"):
+                get_controller().check_abort()
                 if time.time() > deadline:
                     raise TimeoutError(f"Timed out waiting for file {file_name}")
-                time.sleep(1)
+                _sleep(1)
                 current = client.files.get(name=file_name)
             operation = client.file_search_stores.import_file(
                 file_search_store_name=store_name,
@@ -285,19 +299,43 @@ def apply_diff(
     local_hashes: dict[str, str],
     remote_docs: dict[str, dict[str, str]],
     settings: Settings,
-) -> tuple[int, list[str]]:
-    """Upload added/updated docs. Returns (uploaded_count, failed_article_ids).
+) -> tuple[int, list[str], list[str]]:
+    """Upload added/updated docs.
+
+    Returns ``(uploaded_count, failed_article_ids, remaining_article_ids)``.
+    Remaining is non-empty when ``/abort`` stops the batch mid-run.
 
     Does not raise on partial failure so a single flaky Gemini file (e.g. token
     count 503) cannot take down Docker one-shot or Render ``/run``.
     """
+    controller = get_controller()
     uploaded = 0
     failures: list[tuple[str, Exception]] = []
-    for article_id in diff.updated:
-        delete_document(client, remote_docs.get(article_id, {}).get("name", ""))
+    remaining: list[str] = []
+    try:
+        for article_id in diff.updated:
+            controller.check_abort()
+            delete_document(client, remote_docs.get(article_id, {}).get("name", ""))
+    except AbortRequested:
+        remaining = list(diff.upload_ids)
+        logger.info("Aborted before uploads (%s remaining)", len(remaining))
+        return uploaded, [], remaining
     total = len(diff.upload_ids)
     for index, article_id in enumerate(diff.upload_ids, start=1):
+        try:
+            controller.check_abort()
+        except AbortRequested:
+            remaining = list(diff.upload_ids[index - 1 :])
+            logger.info(
+                "Aborting before upload %s/%s (%s remaining)",
+                index,
+                total,
+                len(remaining),
+            )
+            break
         path = local_files[article_id]
+        controller.update(current_file=path.name, files_uploaded=uploaded)
+        logger.info("Uploading %s/%s %s (%s)", index, total, article_id, path.name)
         try:
             upload_markdown(
                 client,
@@ -308,7 +346,17 @@ def apply_diff(
                 settings,
             )
             uploaded += 1
+            controller.update(current_file="", files_uploaded=uploaded, persist=True)
             logger.info("Uploaded %s/%s %s (%s)", index, total, article_id, path.name)
+        except AbortRequested:
+            remaining = list(diff.upload_ids[index - 1 :])
+            logger.info(
+                "Aborted during upload %s/%s (%s remaining)",
+                index,
+                total,
+                len(remaining),
+            )
+            break
         except Exception as exc:  # noqa: BLE001 - keep batch going
             logger.error(
                 "Failed upload %s/%s %s (%s): %s",
@@ -319,8 +367,23 @@ def apply_diff(
                 exc,
             )
             failures.append((article_id, exc))
-        if index < total and UPLOAD_GAP_SEC > 0:
-            time.sleep(UPLOAD_GAP_SEC)
+            controller.update(
+                files_uploaded=uploaded,
+                failed_uploads=[item[0] for item in failures],
+                persist=True,
+            )
+        if index < total and UPLOAD_GAP_SEC > 0 and not remaining:
+            try:
+                _sleep(UPLOAD_GAP_SEC)
+            except AbortRequested:
+                remaining = list(diff.upload_ids[index:])
+                logger.info(
+                    "Aborted after upload %s/%s (%s remaining)",
+                    index,
+                    total,
+                    len(remaining),
+                )
+                break
     failed_ids = [article_id for article_id, _ in failures]
     if failures:
         ids = ", ".join(failed_ids[:20])
@@ -333,4 +396,4 @@ def apply_diff(
             ids,
             more,
         )
-    return uploaded, failed_ids
+    return uploaded, failed_ids, remaining

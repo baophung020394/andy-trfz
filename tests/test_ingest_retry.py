@@ -34,7 +34,7 @@ def test_with_retry_starts_fresh_after_terminated(monkeypatch):
             raise FakeClientError(400, "Upload has already been terminated.")
         return "ok"
 
-    monkeypatch.setattr("src.ingest.time.sleep", lambda _s: None)
+    monkeypatch.setattr("src.ingest._sleep", lambda _s: None)
     assert _with_retry(flaky, attempts=4) == "ok"
     assert calls["n"] == 3
 

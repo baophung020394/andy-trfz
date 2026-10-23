@@ -12,6 +12,7 @@ from src.config import Settings, get_settings
 from src.convert import article_filename, article_to_markdown, content_hash
 from src.diff import classify_changes
 from src.fetch import fetch_articles
+from src.progress import AbortRequested, RunController, get_controller
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +31,8 @@ class RunResult:
     finished_at: str = ""
     error: str | None = None
     failed_uploads: list[str] | None = None
+    remaining_uploads: list[str] | None = None
+    files_to_upload: int = 0
 
     def log_line(self) -> str:
         line = (
@@ -39,6 +42,8 @@ class RunResult:
         )
         if self.failed_uploads:
             line += f" failed_uploads={len(self.failed_uploads)}"
+        if self.remaining_uploads:
+            line += f" remaining={len(self.remaining_uploads)}"
         return line
 
     def to_dict(self) -> dict[str, Any]:
@@ -76,101 +81,167 @@ def load_last_run(path: Path) -> dict[str, Any] | None:
         return None
 
 
+def _finish(controller: RunController, result: RunResult) -> RunResult:
+    controller.complete(**result.to_dict(), phase="done")
+    return result
+
+
 def run_pipeline(settings: Settings | None = None, upload: bool = True) -> RunResult:
     settings = settings or get_settings()
+    controller = get_controller()
+    controller.set_persist_path(settings.last_run_path)
+    if not controller.running:
+        controller.begin()
     finished_at = datetime.now(timezone.utc).isoformat()
-    logger.info("Fetching articles from %s", settings.help_center_base)
-    articles = fetch_articles(settings.help_center_base, settings.help_center_locale)
-    local = write_articles(articles, settings.articles_dir)
-    local_hashes = {article_id: item["hash"] for article_id, item in local.items()}
-    logger.info("Wrote %s markdown files to %s", len(local), settings.articles_dir)
+    try:
+        controller.update(phase="fetching", persist=True)
+        logger.info("Fetching articles from %s", settings.help_center_base)
+        articles = fetch_articles(settings.help_center_base, settings.help_center_locale)
+        controller.check_abort()
+        local = write_articles(articles, settings.articles_dir)
+        local_hashes = {article_id: item["hash"] for article_id, item in local.items()}
+        logger.info("Wrote %s markdown files to %s", len(local), settings.articles_dir)
+        controller.update(phase="writing", article_count=len(local), persist=True)
 
-    if not upload:
+        if not upload:
+            result = RunResult(
+                status="ok",
+                added=len(local),
+                article_count=len(local),
+                finished_at=finished_at,
+            )
+            logger.info(result.log_line())
+            return _finish(controller, result)
+
+        if not settings.gemini_api_key:
+            raise RuntimeError("GEMINI_API_KEY is required for upload")
+
+        from src.ingest import (
+            apply_diff,
+            delete_stale_remote_documents,
+            ensure_store,
+            list_remote_documents,
+            make_client,
+        )
+
+        controller.update(phase="connecting", persist=True)
+        client = make_client(settings.gemini_api_key)
+        store_name = ensure_store(client, settings.file_search_store_name)
+        # Print early so a long upload / Ctrl+C still leaves a copyable store name.
+        print(f"store_name={store_name}", flush=True)
+        logger.info("Using File Search store %s", store_name)
+        controller.update(store_name=store_name, persist=True)
+        deleted = 0
+        if settings.delete_stale_remote:
+            logger.info("DELETE_STALE_REMOTE=true — removing remote docs not in local set")
+            controller.update(phase="deleting_stale", persist=True)
+            deleted = delete_stale_remote_documents(client, store_name, set(local_hashes))
+        else:
+            logger.info("DELETE_STALE_REMOTE=false — keeping existing remote docs")
+
+        controller.update(phase="listing_remote", deleted=deleted, persist=True)
+        remote_docs = list_remote_documents(client, store_name)
+        controller.check_abort()
+        remote_hashes = {
+            article_id: doc.get("content_hash", "") for article_id, doc in remote_docs.items()
+        }
+        diff = classify_changes(local_hashes, remote_hashes)
+        controller.update(
+            phase="uploading",
+            added=len(diff.added),
+            updated=len(diff.updated),
+            skipped=len(diff.skipped),
+            deleted=deleted,
+            files_to_upload=len(diff.upload_ids),
+            files_uploaded=0,
+            store_name=store_name,
+            persist=True,
+        )
+        logger.info(
+            "Diff added=%s updated=%s skipped=%s to_upload=%s",
+            len(diff.added),
+            len(diff.updated),
+            len(diff.skipped),
+            len(diff.upload_ids),
+        )
+        files_uploaded, failed_uploads, remaining = apply_diff(
+            client,
+            store_name,
+            diff,
+            {article_id: item["path"] for article_id, item in local.items()},
+            local_hashes,
+            remote_docs,
+            settings,
+        )
+        done_ids = [
+            article_id
+            for article_id in diff.upload_ids
+            if article_id not in remaining and article_id not in failed_uploads
+        ]
+        chunks_this_run = sum(
+            estimate_chunks(
+                local[article_id]["markdown"],
+                settings.max_chunk_tokens,
+                settings.chunk_overlap_tokens,
+            )
+            for article_id in done_ids
+        )
+        if remaining:
+            status = "aborted"
+            error = "Aborted by operator"
+        elif failed_uploads and files_uploaded == 0 and diff.upload_ids:
+            status = "error"
+            error = (
+                f"Failed to upload all {len(failed_uploads)} article(s): "
+                + ", ".join(failed_uploads[:20])
+            )
+        elif failed_uploads:
+            status = "partial"
+            error = (
+                f"Failed to upload {len(failed_uploads)} article(s): "
+                + ", ".join(failed_uploads[:20])
+            )
+        else:
+            status = "ok"
+            error = None
         result = RunResult(
-            status="ok",
-            added=len(local),
+            status=status,
+            added=len(diff.added),
+            updated=len(diff.updated),
+            skipped=len(diff.skipped),
+            deleted=deleted,
+            files_uploaded=files_uploaded,
+            files_to_upload=len(diff.upload_ids),
+            chunks_embedded=chunks_this_run,
             article_count=len(local),
-            finished_at=finished_at,
+            store_name=store_name,
+            finished_at=datetime.now(timezone.utc).isoformat(),
+            error=error,
+            failed_uploads=failed_uploads or None,
+            remaining_uploads=remaining or None,
         )
         logger.info(result.log_line())
+        _finish(controller, result)
+        if status == "error":
+            raise RuntimeError(error)
         return result
-
-    if not settings.gemini_api_key:
-        raise RuntimeError("GEMINI_API_KEY is required for upload")
-
-    from src.ingest import (
-        apply_diff,
-        delete_stale_remote_documents,
-        ensure_store,
-        list_remote_documents,
-        make_client,
-    )
-
-    client = make_client(settings.gemini_api_key)
-    store_name = ensure_store(client, settings.file_search_store_name)
-    # Print early so a long upload / Ctrl+C still leaves a copyable store name.
-    print(f"store_name={store_name}", flush=True)
-    logger.info("Using File Search store %s", store_name)
-    deleted = 0
-    if settings.delete_stale_remote:
-        logger.info("DELETE_STALE_REMOTE=true — removing remote docs not in local set")
-        deleted = delete_stale_remote_documents(client, store_name, set(local_hashes))
-    else:
-        logger.info("DELETE_STALE_REMOTE=false — keeping existing remote docs")
-
-    remote_docs = list_remote_documents(client, store_name)
-    remote_hashes = {
-        article_id: doc.get("content_hash", "") for article_id, doc in remote_docs.items()
-    }
-    diff = classify_changes(local_hashes, remote_hashes)
-    chunks_this_run = sum(
-        estimate_chunks(
-            local[article_id]["markdown"],
-            settings.max_chunk_tokens,
-            settings.chunk_overlap_tokens,
+    except AbortRequested:
+        snap = controller.snapshot()
+        result = RunResult(
+            status="aborted",
+            added=int(snap.get("added") or 0),
+            updated=int(snap.get("updated") or 0),
+            skipped=int(snap.get("skipped") or 0),
+            deleted=int(snap.get("deleted") or 0),
+            files_uploaded=int(snap.get("files_uploaded") or 0),
+            files_to_upload=int(snap.get("files_to_upload") or 0),
+            chunks_embedded=int(snap.get("chunks_embedded") or 0),
+            article_count=int(snap.get("article_count") or 0),
+            store_name=str(snap.get("store_name") or ""),
+            finished_at=datetime.now(timezone.utc).isoformat(),
+            error="Aborted by operator",
+            failed_uploads=snap.get("failed_uploads") or None,
+            remaining_uploads=snap.get("remaining_uploads") or None,
         )
-        for article_id in diff.upload_ids
-    )
-    files_uploaded, failed_uploads = apply_diff(
-        client,
-        store_name,
-        diff,
-        {article_id: item["path"] for article_id, item in local.items()},
-        local_hashes,
-        remote_docs,
-        settings,
-    )
-    if failed_uploads and files_uploaded == 0 and diff.upload_ids:
-        status = "error"
-        error = (
-            f"Failed to upload all {len(failed_uploads)} article(s): "
-            + ", ".join(failed_uploads[:20])
-        )
-    elif failed_uploads:
-        status = "partial"
-        error = (
-            f"Failed to upload {len(failed_uploads)} article(s): "
-            + ", ".join(failed_uploads[:20])
-        )
-    else:
-        status = "ok"
-        error = None
-    result = RunResult(
-        status=status,
-        added=len(diff.added),
-        updated=len(diff.updated),
-        skipped=len(diff.skipped),
-        deleted=deleted,
-        files_uploaded=files_uploaded,
-        chunks_embedded=chunks_this_run,
-        article_count=len(local),
-        store_name=store_name,
-        finished_at=datetime.now(timezone.utc).isoformat(),
-        error=error,
-        failed_uploads=failed_uploads or None,
-    )
-    logger.info(result.log_line())
-    save_last_run(settings.last_run_path, result)
-    if status == "error":
-        raise RuntimeError(error)
-    return result
+        logger.info(result.log_line())
+        return _finish(controller, result)
