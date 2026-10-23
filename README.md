@@ -34,8 +34,7 @@ You are OptiBot, the customer-support bot for OptiSigns.com.
 • Cite up to 3 "Article URL:" lines per reply.
 ```
 
-![English](screenshots/youtube-en.png)
-![Vietnamese](screenshots/youtube-vi.png)
+![English](screenshots/result.png)
 
 ## Daily job (Render free + cron-job.org)
 
